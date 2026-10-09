@@ -188,18 +188,26 @@ export async function getHighlightsByFolder(folderId) {
   return getAllByIndex('highlights', 'by-folder', IDBKeyRange.only(folderId));
 }
 
+// Next free displayOrder in a list: max + 1, not count — a count collides with
+// an existing item once something earlier in the list has been deleted.
+export async function nextHighlightOrder(listId) {
+  const existing = await getHighlightsByList(listId);
+  return Math.max(-1, ...existing.map((h) => h.displayOrder)) + 1;
+}
+
 export async function createHighlight(data) {
   const db = await openDB();
   // originalPosition is the count of existing highlights in the list at save time.
   // It is set once here and stripped from all future updates.
   const existing = await getHighlightsByList(data.listId);
   const originalPosition = existing.length;
+  const displayOrder = await nextHighlightOrder(data.listId);
   return wrap(
     writeTx(db, 'highlights').add({
       tags: [],
       notes: '',
       checkboxChecked: false,
-      displayOrder: originalPosition,
+      displayOrder,
       conversationUrl: null,
       ...data,
       originalPosition,
@@ -234,75 +242,84 @@ export async function deleteHighlightsByList(listId) {
   return Promise.all(items.map((h) => wrap(store.delete(h.id), 'deleteHighlightsByList')));
 }
 
-// ─── cascade deletes ─────────────────────────────────────────────────────────
-// Phase-1: read all IDs. Phase-2: delete atomically in one transaction.
-// This avoids the IDB auto-commit problem with async gaps inside a transaction.
+// ─── reorder ─────────────────────────────────────────────────────────────────
+// One readwrite transaction for the whole drag: all-or-nothing, one round trip.
 
-async function collectFolderIds(folderId) {
-  const lists = await getListsByFolder(folderId);
-  const listIds = lists.map((l) => l.id);
-  const hArrays = await Promise.all(listIds.map((lid) => getHighlightsByList(lid)));
-  const highlightIds = hArrays.flat().map((h) => h.id);
-  return { listIds, highlightIds };
-}
-
-function atomicDelete(db, { folderIds = [], listIds = [], highlightIds = [] }) {
+async function reorder(storeName, orderedIds) {
+  const db = await openDB();
   return new Promise((resolve, reject) => {
-    const t = db.transaction(['folders', 'lists', 'highlights'], 'readwrite');
-    t.onerror = () => {
-      console.error('[Stash DB] atomicDelete error:', t.error);
+    const t = db.transaction(storeName, 'readwrite');
+    const store = t.objectStore(storeName);
+    t.oncomplete = () => resolve();
+    t.onabort = t.onerror = () => {
+      console.error('[Stash DB] reorder error:', t.error);
       reject(t.error);
     };
-    t.oncomplete = () => resolve();
+    orderedIds.forEach((id, displayOrder) => {
+      store.get(id).onsuccess = (e) => {
+        if (e.target.result) store.put({ ...e.target.result, displayOrder });
+      };
+    });
+  });
+}
 
+export const reorderLists = (orderedIds) => reorder('lists', orderedIds);
+export const reorderHighlights = (orderedIds) => reorder('highlights', orderedIds);
+
+// ─── cascade deletes ─────────────────────────────────────────────────────────
+// Child IDs are collected inside the same transaction that deletes them, so a
+// highlight saved concurrently can't be orphaned. Only request callbacks run
+// between requests, so IDB's auto-commit never fires mid-cascade.
+// children: 'delete' also removes child folders; 'return' resolves with their IDs.
+
+function cascadeDelete(folderId, children) {
+  return openDB().then((db) => new Promise((resolve, reject) => {
+    const t = db.transaction(['folders', 'lists', 'highlights'], 'readwrite');
     const fs = t.objectStore('folders');
     const ls = t.objectStore('lists');
     const hs = t.objectStore('highlights');
+    const childIds = [];
 
-    folderIds.forEach((id) => fs.delete(id));
-    listIds.forEach((id) => ls.delete(id));
-    highlightIds.forEach((id) => hs.delete(id));
-  });
+    t.oncomplete = () => resolve(childIds);
+    t.onabort = t.onerror = () => {
+      console.error('[Stash DB] cascadeDelete error:', t.error);
+      reject(t.error);
+    };
+
+    const dropContents = (id) => {
+      ls.index('by-folder').getAll(IDBKeyRange.only(id)).onsuccess = (e) => {
+        for (const l of e.target.result) {
+          ls.delete(l.id);
+          hs.index('by-list').getAllKeys(IDBKeyRange.only(l.id)).onsuccess = (e2) =>
+            e2.target.result.forEach((k) => hs.delete(k));
+        }
+      };
+    };
+
+    fs.delete(folderId);
+    dropContents(folderId);
+    if (!children) return;
+    fs.index('by-parent').getAll(IDBKeyRange.only(folderId)).onsuccess = (e) => {
+      for (const c of e.target.result) {
+        childIds.push(c.id);
+        if (children === 'delete') {
+          fs.delete(c.id);
+          dropContents(c.id);
+        }
+      }
+    };
+  }));
 }
 
 // §3.2 conversation folder delete: atomic cascade.
-export async function deleteConversationFolderCascade(folderId) {
-  const db = await openDB();
-  const { listIds, highlightIds } = await collectFolderIds(folderId);
-  await atomicDelete(db, { folderIds: [folderId], listIds, highlightIds });
-}
+export const deleteConversationFolderCascade = (folderId) => cascadeDelete(folderId, null);
 
 // §3.2 project folder delete: cascade all child conversation folders.
-export async function deleteProjectFolderCascade(projectFolderId) {
-  const db = await openDB();
-  const convFolders = await getFoldersByParent(projectFolderId);
-  const convFolderIds = convFolders.map((f) => f.id);
+export const deleteProjectFolderCascade = (folderId) => cascadeDelete(folderId, 'delete');
 
-  const collected = await Promise.all(convFolderIds.map(collectFolderIds));
-  const listIds = collected.flatMap((c) => c.listIds);
-  const highlightIds = collected.flatMap((c) => c.highlightIds);
-
-  await atomicDelete(db, {
-    folderIds: [projectFolderId, ...convFolderIds],
-    listIds,
-    highlightIds,
-  });
-}
-
-// §3.2 manual folder delete: remove folder + its lists; move conversation folders to General.
-// Returns the list of conversation folder IDs that were moved (caller re-parents them).
-export async function deleteManualFolderCascade(folderId) {
-  const db = await openDB();
-  const lists = await getListsByFolder(folderId);
-  const listIds = lists.map((l) => l.id);
-  const hArrays = await Promise.all(listIds.map((lid) => getHighlightsByList(lid)));
-  const highlightIds = hArrays.flat().map((h) => h.id);
-
-  const convFolders = await getFoldersByParent(folderId);
-
-  await atomicDelete(db, { folderIds: [folderId], listIds, highlightIds });
-  return convFolders.map((f) => f.id);
-}
+// §3.2 manual folder delete: remove folder + its lists; conversation folders inside are kept.
+// Returns their IDs (caller re-parents them).
+export const deleteManualFolderCascade = (folderId) => cascadeDelete(folderId, 'return');
 
 // ─── meta ────────────────────────────────────────────────────────────────────
 
