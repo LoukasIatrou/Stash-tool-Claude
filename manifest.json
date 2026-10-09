@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Stash",
+  "version": "2.0.0",
+  "description": "Save and organise highlights from Claude conversations.",
+  "permissions": ["storage"],
+  "host_permissions": ["https://claude.ai/*"],
+  "action": {
+    "default_title": "Toggle Stash"
+  },
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*"],
+      "js": ["content/index.js"],
+      "css": ["content/pin-button.css"],
+      "type": "module",
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content/sidebar/sidebar.css"],
+      "matches": ["https://claude.ai/*"]
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
